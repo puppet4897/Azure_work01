@@ -97,7 +97,7 @@ jobs:
 
       - name: Create or update reminder issue
         if: steps.collect.outputs.found == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           REPORT: ${{ steps.collect.outputs.report }}
           COST: ${{ steps.cost.outputs.total }}
@@ -140,7 +140,7 @@ jobs:
 
       - name: Close reminder if destroyed
         if: steps.collect.outputs.found == 'false'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { data: issues } = await github.rest.issues.listForRepo({
