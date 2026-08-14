@@ -1,0 +1,13 @@
+# 一人運用のため、コードオーナーによるレビュー必須化は行いません。
+#
+# GitHub の "Require review from Code Owners" を有効にすると、
+# 自分の PR を自分で承認できず main にマージできなくなります。
+# ブランチ保護では status checks（Terraform Plan / Security Scan）のみ必須にしてください。
+#
+# 将来チームで運用する場合は、以下のコメントを外して運用してください。
+#
+# *                   @puppet4897
+# *.tf                @puppet4897
+# /env/               @puppet4897
+# /.github/workflows/ @puppet4897
+# /scripts/           @puppet4897

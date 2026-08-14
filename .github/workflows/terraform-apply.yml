@@ -1,0 +1,101 @@
+name: Terraform Apply
+
+# main へのマージで起動し、Environment "dev" の承認ゲートで停止する。
+# Public リポジトリのため Environment の保護ルール（Required reviewers）が
+# GitHub Free でも利用できる。
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - 'env/**'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.13.0'
+  ENVIRONMENT: dev
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_repository_name: ${{ github.repository }}
+  # Public リポジトリのため接続元 IP はコードに書かず Secrets から注入する
+  TF_VAR_allowed_source_ip: ${{ secrets.ALLOWED_SOURCE_IP }}
+
+concurrency:
+  group: terraform-state-dev
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: Apply to dev
+    runs-on: ubuntu-latest
+    # 承認ゲート。Settings > Environments > dev で Required reviewers を設定する。
+    environment: dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: terraform init -backend-config=env/${{ env.ENVIRONMENT }}.backend.hcl -input=false
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file=env/${{ env.ENVIRONMENT }}.tfvars \
+            -input=false -no-color -lock-timeout=5m \
+            -out=tfplan | tee plan_raw.txt
+          CHANGES=$(grep -E '^(Plan:|No changes\.)' plan_raw.txt | tail -1 || echo "不明")
+          echo "changes=${CHANGES}" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform apply
+        run: terraform apply -input=false -no-color -lock-timeout=5m -auto-approve tfplan
+
+      - name: Write job summary
+        if: success()
+        run: |
+          {
+            echo "## デプロイ完了 (${{ env.ENVIRONMENT }})"
+            echo ""
+            echo "**${{ steps.plan.outputs.changes }}**"
+            echo ""
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| Resource Group | \`$(terraform output -raw resource_group_name)\` |"
+            echo "| VM | \`$(terraform output -raw vm_name)\` |"
+            echo "| Private IP | \`$(terraform output -raw vm_private_ip)\` |"
+            echo "| Bastion SKU | \`$(terraform output -raw bastion_sku)\` |"
+            echo "| Key Vault | \`$(terraform output -raw key_vault_name)\` |"
+            echo ""
+            echo "### 接続元 IP 制限"
+            echo "$(terraform output -raw source_ip_restriction)"
+            echo ""
+            echo "### 管理者パスワードの取得"
+            echo '```bash'
+            echo "$(terraform output -raw get_credentials_command)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up plan file
+        if: always()
+        run: rm -f tfplan

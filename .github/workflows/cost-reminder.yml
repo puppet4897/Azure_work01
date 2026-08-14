@@ -1,0 +1,155 @@
+name: Cost Reminder
+
+# テスト環境の消し忘れ対策。
+# リソースが残っていれば毎週 Issue で通知し、実際の課金額も併記する。
+on:
+  schedule:
+    # 毎週月曜 09:00 JST (日曜 00:00 UTC)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  ARM_USE_OIDC: 'true'
+
+jobs:
+  remind:
+    name: Check running resources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Collect resource state
+        id: collect
+        run: |
+          set -euo pipefail
+
+          # このリポジトリが作ったリソースグループをタグから特定
+          REPO_TAG="${GITHUB_REPOSITORY//\//-}"
+          RGS=$(az group list \
+            --query "[?tags.managed_by=='terraform' && tags.repository=='${REPO_TAG}'].name" -o tsv)
+
+          if [ -z "$RGS" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "リソースグループなし"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+          {
+            echo 'report<<REPORTEOF'
+            for RG in $RGS; do
+              echo "#### リソースグループ: \`${RG}\`"
+              echo ""
+              echo "| リソース | 種別 | 状態 |"
+              echo "|---|---|---|"
+
+              # VM の電源状態
+              az vm list --resource-group "$RG" --show-details \
+                --query "[].{n:name, s:powerState}" -o tsv 2>/dev/null | \
+                while IFS=$'\t' read -r n s; do
+                  echo "| ${n} | Virtual Machine | ${s} |"
+                done
+
+              # 固定費がかかるリソースを明示
+              az resource list --resource-group "$RG" \
+                --query "[?type=='Microsoft.Network/bastionHosts' || type=='Microsoft.Network/publicIPAddresses' || type=='Microsoft.Compute/disks'].{n:name, t:type}" \
+                -o tsv 2>/dev/null | \
+                while IFS=$'\t' read -r n t; do
+                  echo "| ${n} | ${t} | 存在 |"
+                done
+              echo ""
+            done
+            echo 'REPORTEOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Get last 30 days cost
+        id: cost
+        continue-on-error: true
+        run: |
+          set +e
+          SUB=$(az account show --query id -o tsv)
+          FROM=$(date -u -d '30 days ago' +%Y-%m-%d)
+          TO=$(date -u +%Y-%m-%d)
+          # Cost Management API (SP に Cost Management Reader ロールが必要)
+          BODY="{\"type\":\"ActualCost\",\"timeframe\":\"Custom\",\"timePeriod\":{\"from\":\"${FROM}\",\"to\":\"${TO}\"},\"dataset\":{\"granularity\":\"None\",\"aggregation\":{\"totalCost\":{\"name\":\"Cost\",\"function\":\"Sum\"}}}}"
+          RESULT=$(az rest --method post \
+            --url "https://management.azure.com/subscriptions/${SUB}/providers/Microsoft.CostManagement/query?api-version=2023-11-01" \
+            --headers 'Content-Type=application/json' \
+            --body "$BODY" --query "properties.rows" -o json 2>/dev/null)
+          SUMMARY=$(echo "${RESULT:-[]}" | jq -r 'if length > 0 then "\(map(.[0]) | add | . * 100 | round / 100) \(.[0][-1])" else "" end' 2>/dev/null)
+          if [ -n "$SUMMARY" ] && [ "$SUMMARY" != "null" ]; then
+            echo "total=直近30日のサブスクリプション課金額: **${SUMMARY}**" >> "$GITHUB_OUTPUT"
+          else
+            echo 'total=_課金額の取得をスキップしました（SP に Cost Management Reader ロールが必要です）_' >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Create or update reminder issue
+        if: steps.collect.outputs.found == 'true'
+        uses: actions/github-script@v7
+        env:
+          REPORT: ${{ steps.collect.outputs.report }}
+          COST: ${{ steps.cost.outputs.total }}
+        with:
+          script: |
+            const title = '[cost] テスト環境が稼働中です';
+            const body = [
+              '## テスト環境のリソースが残っています',
+              '',
+              process.env.COST || '',
+              '',
+              process.env.REPORT || '',
+              '### まだ使う場合',
+              'このまま放置で問題ありません。VM は毎日 19:00 JST に自動停止します。',
+              '',
+              '### もう使わない場合',
+              `[Terraform Destroy](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/workflows/terraform-destroy.yml) を実行してください。`,
+              '環境名に `dev` を 2 回入力すると破棄されます。',
+              '',
+              `*${new Date().toISOString().slice(0, 10)} 時点の自動チェック*`,
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'cost',
+            });
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['cost'],
+              });
+            }
+
+      - name: Close reminder if destroyed
+        if: steps.collect.outputs.found == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'cost',
+            });
+            for (const i of issues.filter(x => x.title === '[cost] テスト環境が稼働中です')) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: i.number, state: 'closed',
+              });
+            }

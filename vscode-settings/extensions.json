@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "hashicorp.terraform",
+    "ms-azuretools.vscode-azureterraform",
+    "ms-vscode.azurecli",
+    "ms-azuretools.vscode-azureresourcegroups"
+  ]
+}

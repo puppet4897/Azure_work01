@@ -1,0 +1,12 @@
+# このファイルは廃止されました。
+#
+# GitHub 管理に移行したため、環境ごとの変数は env/ 配下で Git 管理しています。
+#   env/dev.tfvars       ... 変数定義（機密情報なし・コミット対象）
+#   env/dev.backend.hcl  ... tfstate バックエンド設定（コミット対象）
+#
+# ローカル実行時:
+#   terraform init -backend-config=env/dev.backend.hcl
+#   terraform plan -var-file=env/dev.tfvars
+#
+# 個人的な一時上書きが必要な場合のみ terraform.tfvars を作成してください
+# （.gitignore 済みです）。

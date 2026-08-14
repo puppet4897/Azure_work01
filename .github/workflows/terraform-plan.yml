@@ -1,0 +1,180 @@
+name: Terraform Plan
+
+# 作業ブランチへの push と PR で plan を走らせる。
+# main への push は Terraform Apply 側が plan → 承認 → apply を行うので対象外。
+# PR があれば PR にコメント、なければ Job Summary に出力する。
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.tf'
+      - 'env/**'
+      - '.github/workflows/terraform-*.yml'
+  push:
+    branches-ignore: [main]
+    paths:
+      - '**.tf'
+      - 'env/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.13.0'
+  ENVIRONMENT: dev
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_repository_name: ${{ github.repository }}
+  # Public リポジトリのため接続元 IP はコードに書かず Secrets から注入する
+  TF_VAR_allowed_source_ip: ${{ secrets.ALLOWED_SOURCE_IP }}
+
+concurrency:
+  group: terraform-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan (dev)
+    runs-on: ubuntu-latest
+    # Public リポジトリのため、fork からの PR では実行しない。
+    # fork PR には OIDC トークンが発行されず、必ず失敗するため。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init
+        id: init
+        run: terraform init -backend-config=env/${{ env.ENVIRONMENT }}.backend.hcl -input=false
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var-file=env/${{ env.ENVIRONMENT }}.tfvars \
+            -input=false -no-color -lock-timeout=5m \
+            -out=tfplan | tee plan_raw.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract plan summary
+        id: summary
+        if: always()
+        run: |
+          tail -c 60000 plan_raw.txt > plan_trimmed.txt 2>/dev/null || echo "(no plan output)" > plan_trimmed.txt
+          CHANGES=$(grep -E '^(Plan:|No changes\.)' plan_raw.txt | tail -1 || echo "plan 未完了")
+          echo "changes=${CHANGES}" >> "$GITHUB_OUTPUT"
+          {
+            echo 'stdout<<PLANEOF'
+            cat plan_trimmed.txt
+            echo 'PLANEOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform Plan (dev)"
+            echo ""
+            echo "**${{ steps.summary.outputs.changes }}**"
+            echo ""
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| fmt | \`${{ steps.fmt.outcome }}\` |"
+            echo "| init | \`${{ steps.init.outcome }}\` |"
+            echo "| validate | \`${{ steps.validate.outcome }}\` |"
+            echo "| plan | \`${{ steps.plan.outcome }}\` |"
+            echo ""
+            echo "<details><summary>Plan の詳細</summary>"
+            echo ""
+            echo '```terraform'
+            cat plan_trimmed.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.summary.outputs.stdout }}
+        with:
+          script: |
+            const plan = process.env.PLAN || '(no output)';
+            const lines = [
+              '### Terraform Plan `dev`',
+              '',
+              '**${{ steps.summary.outputs.changes }}**',
+              '',
+              '| Step | Result |',
+              '|---|---|',
+              '| fmt | `${{ steps.fmt.outcome }}` |',
+              '| init | `${{ steps.init.outcome }}` |',
+              '| validate | `${{ steps.validate.outcome }}` |',
+              '| plan | `${{ steps.plan.outcome }}` |',
+              '',
+              '<details><summary>Plan の詳細を開く</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+              '',
+              '*commit `${{ github.sha }}`*',
+            ];
+            const body = lines.join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('### Terraform Plan'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Fail if plan errored
+        if: steps.plan.outputs.exitcode != '0'
+        run: exit 1

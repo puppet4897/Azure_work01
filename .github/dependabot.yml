@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # GitHub Actions のバージョン更新
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Tokyo
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: 'ci'
+
+  # Terraform プロバイダー / モジュールの更新
+  - package-ecosystem: terraform
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '09:00'
+      timezone: Asia/Tokyo
+    labels: [dependencies, terraform]
+    commit-message:
+      prefix: 'chore'

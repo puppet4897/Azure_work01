@@ -1,0 +1,73 @@
+name: Terraform Destroy
+
+# テスト環境を片付けてコストを止めるための手動ワークフロー。
+# 誤爆防止は「手動実行のみ + 環境名の二重入力 + Environment の承認ゲート」の三重。
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '破棄する環境名'
+        required: true
+        type: choice
+        options: [dev]
+      confirm:
+        description: '確認のため環境名をもう一度入力 (例: dev)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: '1.13.0'
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_repository_name: ${{ github.repository }}
+  # Public リポジトリのため接続元 IP はコードに書かず Secrets から注入する
+  TF_VAR_allowed_source_ip: ${{ secrets.ALLOWED_SOURCE_IP }}
+
+concurrency:
+  group: terraform-state-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    name: Destroy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Verify confirmation input
+        run: |
+          if [ "${{ inputs.confirm }}" != "${{ inputs.environment }}" ]; then
+            echo "::error::確認入力が一致しません。処理を中止します。"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: terraform init -backend-config=env/${{ inputs.environment }}.backend.hcl -input=false
+
+      - name: Terraform destroy
+        run: |
+          terraform destroy \
+            -var-file=env/${{ inputs.environment }}.tfvars \
+            -input=false -no-color -lock-timeout=5m -auto-approve

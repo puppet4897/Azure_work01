@@ -1,0 +1,140 @@
+name: Drift Detection
+
+# ポータルでの手動変更など、コードと実環境のズレを定期的に検出する。
+# 一人運用ではレビューによる牽制が効かないため、この自動チェックが
+# 「気づかないうちに構成が変わっていた」を防ぐ役割を担う。
+on:
+  schedule:
+    # 毎日 08:00 JST (23:00 UTC)
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  TF_VERSION: '1.13.0'
+  ENVIRONMENT: dev
+  ARM_USE_OIDC: 'true'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_repository_name: ${{ github.repository }}
+  # Public リポジトリのため接続元 IP はコードに書かず Secrets から注入する
+  TF_VAR_allowed_source_ip: ${{ secrets.ALLOWED_SOURCE_IP }}
+
+concurrency:
+  group: terraform-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: Detect drift (dev)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        run: terraform init -backend-config=env/${{ env.ENVIRONMENT }}.backend.hcl -input=false
+
+      - name: Terraform plan (detailed exitcode)
+        id: plan
+        run: |
+          set +e
+          terraform plan \
+            -var-file=env/${{ env.ENVIRONMENT }}.tfvars \
+            -input=false -no-color -lock-timeout=5m \
+            -detailed-exitcode | tee drift.txt
+          CODE=${PIPESTATUS[0]}
+          echo "exitcode=${CODE}" >> "$GITHUB_OUTPUT"
+          # 0 = 差分なし / 1 = エラー / 2 = 差分あり
+          {
+            echo 'output<<DRIFTEOF'
+            tail -c 50000 drift.txt
+            echo 'DRIFTEOF'
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report result
+        uses: actions/github-script@v7
+        env:
+          DRIFT: ${{ steps.plan.outputs.output }}
+          CODE: ${{ steps.plan.outputs.exitcode }}
+        with:
+          script: |
+            const code = process.env.CODE;
+            const title = '[drift] dev 環境がコードと乖離しています';
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'drift',
+            });
+            const existing = issues.find(i => i.title === title);
+
+            if (code === '0') {
+              core.info('差分なし');
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: existing.number,
+                  body: '差分が解消されたため自動クローズします。',
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: existing.number, state: 'closed',
+                });
+              }
+              return;
+            }
+
+            const heading = code === '2'
+              ? '実環境とコードに差分があります。ポータルでの手動変更が原因の可能性があります。'
+              : 'plan の実行に失敗しました。認証情報や state を確認してください。';
+
+            const body = [
+              `## ${heading}`,
+              '',
+              `検出日時: ${new Date().toISOString()}`,
+              `実行: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '### 対応方法',
+              '- コード側が正しい場合 → Terraform Apply を手動実行して実環境を戻す',
+              '- 実環境側が正しい場合 → コードを修正して PR を出す',
+              '',
+              '<details><summary>plan 出力</summary>',
+              '',
+              '```terraform',
+              process.env.DRIFT || '(no output)',
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['drift'],
+              });
+            }
