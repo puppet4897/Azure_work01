@@ -11,6 +11,10 @@ updates:
     labels: [dependencies, ci]
     commit-message:
       prefix: 'ci'
+    groups:
+      # まとめて 1 つの PR にして、レビュー回数を減らす（一人運用のため）
+      actions:
+        patterns: ['*']
 
   # Terraform プロバイダー / モジュールの更新
   - package-ecosystem: terraform
@@ -23,3 +27,8 @@ updates:
     labels: [dependencies, terraform]
     commit-message:
       prefix: 'chore'
+    ignore:
+      # azurerm v5 は破壊的変更を含むため、意図的に v4 系に固定している。
+      # 移行する場合は手動で対応する。
+      - dependency-name: hashicorp/azurerm
+        update-types: [version-update:semver-major]

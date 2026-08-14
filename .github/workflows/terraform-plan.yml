@@ -41,11 +41,15 @@ jobs:
   plan:
     name: Plan (dev)
     runs-on: ubuntu-latest
-    # Public リポジトリのため、fork からの PR では実行しない。
-    # fork PR には OIDC トークンが発行されず、必ず失敗するため。
+    # 実行をスキップする条件:
+    #   1. fork からの PR    … OIDC トークンが発行されないため必ず失敗する
+    #   2. Dependabot の PR  … Dependabot 起動のワークフローには通常の Secrets が
+    #                          渡されない仕様のため、Azure 認証ができない
+    # いずれも Security Scan (Checkov + tflint) 側で静的チェックは行われる。
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
 
     steps:
       - name: Checkout
@@ -56,6 +60,29 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
+
+      - name: Verify required secrets
+        # azure/login は値が空でも「supplied されていない」としか言わないため、
+        # どの Secret が欠けているのかをここで先に切り分ける。
+        # 値そのものは出力せず、長さだけを表示する。
+        run: |
+          missing=0
+          check() {
+            local name="$1" value="$2"
+            if [ -z "$value" ]; then
+              echo "::error::Secret ${name} が未設定または空です"
+              missing=1
+            else
+              echo "OK ${name} (${#value} 文字)"
+            fi
+          }
+          check AZURE_CLIENT_ID       "${{ secrets.AZURE_CLIENT_ID }}"
+          check AZURE_TENANT_ID       "${{ secrets.AZURE_TENANT_ID }}"
+          check AZURE_SUBSCRIPTION_ID "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Settings > Secrets and variables > Actions > Repository secrets を確認してください"
+            exit 1
+          fi
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
