@@ -7,7 +7,7 @@ terraform {
       # 4.75 以降を要求する理由:
       #   azurerm_key_vault の `rbac_authorization_enabled`（旧 enable_rbac_authorization）
       #   を使用しているため。v5.0 には破壊的変更があるので上限を切っている。
-      version = "~> 4.75"
+      version = "~> 5.7"
     }
     random = {
       source  = "hashicorp/random"
